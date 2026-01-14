@@ -34,31 +34,9 @@ def check_conda_environment(expected_env='ieiv'):
 
 
 from IVIE.ivie import IE
+from IVIE.iv_loss import interval_loss as IntervalLoss
+from IVIE.iv_loss import ImprovedIntervalLoss, HausdorffIntervalLoss
 
-
-class IntervalLoss(nn.Module):
-    """区间值损失函数：计算预测区间与真实区间之间的距离"""
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, pred_l, pred_u, target):
-        """
-        pred_l: 预测区间的左端点
-        pred_u: 预测区间的右端点
-        target: 真实区间 [左端点, 右端点]
-        """
-        target_l = target[:, 0:1]
-        target_u = target[:, 1:2]
-        
-        # 计算区间端点之间的MSE
-        loss_l = torch.mean((pred_l - target_l) ** 2)
-        loss_u = torch.mean((pred_u - target_u) ** 2)
-        loss = loss_l + loss_u
-        
-        # 计算误差距离
-        distance = torch.abs(pred_l - target_l) + torch.abs(pred_u - target_u)
-        
-        return loss, distance
 
 
 def generate_interval_data(n_samples=100, n_features=3, seed=42):
@@ -277,7 +255,7 @@ def test_ie_with_uci_data():
     model = IE(
         feature_size=n_features, 
         op='Algebraic_interval', 
-        alpha=1, 
+        alpha=0.5, 
         beta=0, 
         device=device
     )
@@ -296,7 +274,7 @@ def test_ie_with_uci_data():
     
     print(f"\n训练参数:")
     print(f"  - op: Algebraic_interval")
-    print(f"  - alpha: 1")
+    print(f"  - alpha: 0.5")
     print(f"  - beta: 0")
     print(f"  - epochs: {epochs}")
     print(f"  - batch_size: {batch_size}")
@@ -333,6 +311,231 @@ def test_ie_with_uci_data():
     return model
 
 
+def test_ie_with_uci_data_improved():
+    """
+    使用改进的训练配置在UCI数据集上训练
+    
+    改进点:
+    1. 改进的数据预处理（避免负值和越界）
+    2. 改进的损失函数（ImprovedIntervalLoss）
+    3. 更好的优化器配置（AdamW + 学习率调度）
+    4. 早停机制
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+    from ucimlrepo import fetch_ucirepo
+    
+    print("正在从UCI获取数据集...")
+    
+    # fetch dataset (Auto MPG dataset)
+    auto_mpg = fetch_ucirepo(id=9)
+
+    # data (as pandas dataframes)
+    X = auto_mpg.data.features
+    y = auto_mpg.data.targets
+  
+    X.fillna(X.mean(), inplace=True)
+    df = X
+    
+    # 归一化到 [0, 1]
+    y = (y - y.min()) / (y.max() - y.min())
+    df = (df - df.min()) / (df.max() - df.min())
+
+    # ============== 改进1: 更好的区间构造方法 ==============
+    # 使用比例偏移而不是标准差偏移，避免负值和越界
+    data_low = pd.DataFrame(index=df.index, columns=df.columns)
+    data_up = pd.DataFrame(index=df.index, columns=df.columns)
+    
+    spread_ratio = 0.1  # 使用10%的区间宽度
+    for feature in df.columns:
+        # 方法1: 比例偏移（推荐）
+        data_low[feature] = (df[feature] * (1 - spread_ratio)).clip(lower=0)
+        data_up[feature] = (df[feature] * (1 + spread_ratio)).clip(upper=1)
+    
+    # 对标签也进行类似处理
+    y_spread = 0.05
+    y_low = (y * (1 - y_spread)).clip(lower=0)
+    y_up = (y * (1 + y_spread)).clip(upper=1)
+    
+    data_low = pd.concat((data_low, y_low), axis=1)
+    data_up = pd.concat((data_up, y_up), axis=1)
+    Df = pd.concat((data_low, data_up), axis=1)
+    lenth = len(data_up.columns)
+
+    data_train, data_test = train_test_split(Df, test_size=0.2, random_state=42)
+    
+    X_train = pd.concat((data_train.iloc[:, :lenth - 1], data_train.iloc[:, lenth:2 * lenth - 1]), axis=1)
+    y_train = pd.concat((data_train.iloc[:, lenth - 1:lenth], data_train.iloc[:, 2 * lenth - 1:2 * lenth]), axis=1)
+    X_test = pd.concat((data_test.iloc[:, :lenth - 1], data_test.iloc[:, lenth:2 * lenth - 1]), axis=1)
+    y_test = pd.concat((data_test.iloc[:, lenth - 1:lenth], data_test.iloc[:, 2 * lenth - 1:2 * lenth]), axis=1)
+    
+    n_features = X_train.shape[1] // 2
+    print(f"特征数量: {n_features}")
+    print(f"训练集大小: {len(X_train)}")
+    print(f"测试集大小: {len(X_test)}")
+    
+    # 检查数据范围
+    X_train_tensor = torch.tensor(X_train.values, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test.values, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32)
+    
+    print(f"\n数据范围检查:")
+    print(f"  X_train 范围: [{X_train_tensor.min():.4f}, {X_train_tensor.max():.4f}]")
+    print(f"  y_train 范围: [{y_train_tensor.min():.4f}, {y_train_tensor.max():.4f}]")
+    
+    # ============== 改进2: 更好的训练参数 ==============
+    batch_size = 32
+    epochs = 300  # 减少epochs，配合早停
+    learning_rate = 0.005  # 稍大的学习率
+    weight_decay = 1e-5  # 较小的权重衰减
+    
+    # 创建模型
+    # 关键改进: 限制 additivity_order 为2或3，避免高阶组合导致的数值下溢
+    # 当使用 Algebraic_interval 时，高阶乘法会使特征值趋近于0
+    additivity_order = 2  # 只考虑2阶交互，避免数值问题
+    
+    model = IE(
+        feature_size=n_features, 
+        additivity_order=additivity_order,  # 限制交互阶数
+        op='Algebraic_interval',
+        alpha=0.5, 
+        beta=0, 
+        device=device
+    )
+    model = model.to(device)
+    
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # ============== 改进3: 使用改进的损失函数 ==============
+    criterion = ImprovedIntervalLoss(validity_weight=0.1, width_weight=0.05)
+    
+    # ============== 改进4: 使用AdamW + 学习率调度 ==============
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    
+    print(f"\n改进的训练参数:")
+    print(f"  - op: Algebraic_interval")
+    print(f"  - additivity_order: {additivity_order} (限制交互阶数避免数值下溢)")
+    print(f"  - alpha: 0.5, beta: 0")
+    print(f"  - epochs: {epochs}")
+    print(f"  - batch_size: {batch_size}")
+    print(f"  - learning_rate: {learning_rate}")
+    print(f"  - weight_decay: {weight_decay}")
+    print(f"  - 损失函数: ImprovedIntervalLoss")
+    print(f"  - 调度器: CosineAnnealingLR")
+    print(f"  - device: {device}")
+    
+    print("\n开始训练...")
+    
+    # 使用改进的训练循环（带早停和学习率调度）
+    best_val_loss = float('inf')
+    patience = 30
+    patience_counter = 0
+    
+    import time
+    start = time.time()
+    model.train_loss_list = []
+    model.val_loss_list = []
+    
+    for epoch in range(epochs):
+        # 训练
+        model.train()
+        train_loss = 0
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputsl, outputsu = model(images)
+            loss, _ = criterion(outputsl, outputsu, labels)
+            train_loss += loss.item() * len(labels)
+            loss.backward()
+            
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+        
+        avg_train_loss = train_loss / len(train_loader.dataset)
+        
+        # 验证
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputsl, outputsu = model(images)
+                loss, _ = criterion(outputsl, outputsu, labels)
+                val_loss += loss.item() * len(labels)
+        
+        avg_val_loss = val_loss / len(test_loader.dataset)
+        
+        # 学习率调度
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        model.train_loss_list.append(avg_train_loss)
+        model.val_loss_list.append(avg_val_loss)
+        
+        # 早停检查
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+        
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            print(f'Epoch [{epoch + 1}/{epochs}], train_loss: {avg_train_loss:.6f}, '
+                  f'val_loss: {avg_val_loss:.6f}, lr: {current_lr:.6f}')
+        
+        # 早停
+        if patience_counter >= patience:
+            print(f"\n早停触发于 epoch {epoch + 1}")
+            model.load_state_dict(best_model_state)
+            break
+    
+    print(f"\n训练时间: {time.time() - start:.2f}秒")
+    print(f"最佳验证损失: {best_val_loss:.6f}")
+    
+    # 最终评估
+    model.eval()
+    with torch.no_grad():
+        X_sample = X_test_tensor[:10].to(device)
+        pred_l, pred_u = model(X_sample)
+        
+        print(f"\n预测样例 (前10个):")
+        print(f"{'预测下界':<12} {'预测上界':<12} {'真实下界':<12} {'真实上界':<12} {'下界误差':<12} {'上界误差':<12}")
+        print("-" * 72)
+        for i in range(10):
+            pl = pred_l[i, 0].item()
+            pu = pred_u[i, 0].item()
+            tl = y_test_tensor[i, 0].item()
+            tu = y_test_tensor[i, 1].item()
+            el = abs(pl - tl)
+            eu = abs(pu - tu)
+            print(f"{pl:<12.4f} {pu:<12.4f} {tl:<12.4f} {tu:<12.4f} {el:<12.4f} {eu:<12.4f}")
+        
+        # 计算整体指标
+        all_pred_l, all_pred_u = model(X_test_tensor.to(device))
+        mae_lower = torch.mean(torch.abs(all_pred_l - y_test_tensor[:, 0:1].to(device))).item()
+        mae_upper = torch.mean(torch.abs(all_pred_u - y_test_tensor[:, 1:2].to(device))).item()
+        
+        print(f"\n整体评估指标:")
+        print(f"  下界MAE: {mae_lower:.6f}")
+        print(f"  上界MAE: {mae_upper:.6f}")
+        print(f"  平均MAE: {(mae_lower + mae_upper) / 2:.6f}")
+    
+    print("\n改进版UCI数据集训练测试完成!")
+    return model
+
+
 if __name__ == '__main__':
     # 检查 conda 环境
     print("=" * 50)
@@ -341,25 +544,30 @@ if __name__ == '__main__':
     if not check_conda_environment('ieiv'):
         print("\n继续运行测试...\n")
     
-    print("\n" + "=" * 50)
-    print("测试1: IE模型前向传播")
-    print("=" * 50)
-    test_ie_forward()
+    # print("\n" + "=" * 50)
+    # print("测试1: IE模型前向传播")
+    # print("=" * 50)
+    # test_ie_forward()
+    
+    # print("\n" + "=" * 50)
+    # print("测试2: IE模型训练 (Min_interval)")
+    # print("=" * 50)
+    # test_ie_train()
+    
+    # print("\n" + "=" * 50)
+    # print("测试3: IE模型训练 (Algebraic_interval)")
+    # print("=" * 50)
+    # test_ie_algebraic_interval()
+    
+    # print("\n" + "=" * 50)
+    # print("测试4: 使用UCI数据集训练 (原始版本)")
+    # print("=" * 50)
+    # test_ie_with_uci_data()
     
     print("\n" + "=" * 50)
-    print("测试2: IE模型训练 (Min_interval)")
+    print("测试5: 使用UCI数据集训练 (改进版本)")
     print("=" * 50)
-    test_ie_train()
-    
-    print("\n" + "=" * 50)
-    print("测试3: IE模型训练 (Algebraic_interval)")
-    print("=" * 50)
-    test_ie_algebraic_interval()
-    
-    print("\n" + "=" * 50)
-    print("测试4: 使用UCI数据集训练 (Algebraic_interval, alpha=1, beta=0, epochs=500)")
-    print("=" * 50)
-    test_ie_with_uci_data()
+    test_ie_with_uci_data_improved()
     
     print("\n" + "=" * 50)
     print("所有测试通过!")

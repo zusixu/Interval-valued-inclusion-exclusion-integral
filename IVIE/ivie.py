@@ -134,15 +134,11 @@ class IE(nn.Module):
         featuers_datal_mt = torch.matmul(featuers_datal, feature_matrix_to_use)
         featuers_datau_mt = torch.matmul(featuers_datau, feature_matrix_to_use)
         
-        # FM 的最后一行是常数项1，不参与矩阵乘法
-        # 只使用 FM 的前n行（不包括最后的常数行）
-        FM_for_mult = FM_to_use[:-1, :]
-        
         # 拆分左右端点
-        a = torch.matmul(FM_for_mult.T, featuers_datal_mt[:, ::2].T)  # 奇数列（左端点）
-        b = torch.matmul(FM_for_mult.T, featuers_datau_mt[:, ::2].T)  # 奇数列（左端点）
-        c = torch.matmul(FM_for_mult.T, featuers_datal_mt[:, 1::2].T) # 偶数列（右端点）
-        d = torch.matmul(FM_for_mult.T, featuers_datau_mt[:, 1::2].T) # 偶数列（右端点）
+        a = torch.matmul(FM_to_use.T, featuers_datal_mt[:, ::2].T)  # 奇数列（左端点）
+        b = torch.matmul(FM_to_use.T, featuers_datau_mt[:, ::2].T)  # 奇数列（左端点）
+        c = torch.matmul(FM_to_use.T, featuers_datal_mt[:, 1::2].T) # 偶数列（右端点）
+        d = torch.matmul(FM_to_use.T, featuers_datau_mt[:, 1::2].T) # 偶数列（右端点）
         
         # 区间减法
         left = torch.min(a - c, b - d)

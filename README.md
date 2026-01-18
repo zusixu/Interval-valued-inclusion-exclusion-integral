@@ -20,7 +20,7 @@ final_ie_chi/
 
 ### 1. [IVIE_FM](IVIE_FM/README.md)
 
-区间值模糊积分神经网络 - FM（Fuzzy Measure）实现版本
+区间值IE积分神经网络 - FM（Fuzzy Measure）实现版本
 
 **核心特性**:
 - 支持Algebraic_interval和Min_interval两种区间运算
@@ -28,7 +28,6 @@ final_ie_chi/
 - 支持限制交互阶数，避免数值下溢
 - 提供多种损失函数
 
-**适用场景**: 一般区间值预测任务
 
 **快速开始**:
 ```python
@@ -45,12 +44,11 @@ model = IE(feature_size=7, additivity_order=2, op='Algebraic_interval')
 区间值IE积分神经网络 - Moebius实现版本
 
 **核心特性**:
-- Admissible排序机制
+- Admissible order排序机制
 - 单值/区间值模糊测度可选
 - 记忆化特征组合算法
 - 向量化批量处理
 
-**适用场景**: 需要严格排序机制的区间值任务
 
 **快速开始**:
 ```python
@@ -69,10 +67,8 @@ model = IE(feature_size=7, additivity_order=2, op='Min_interval',
 
 **核心特性**:
 - 继承自IVIE_FM，使用区间加法替代区间减法
-- 适合需要累积效应的场景
 - 完全兼容IVIE_FM的接口
 
-**适用场景**: 需要累积效应的区间值预测任务
 
 **快速开始**:
 ```python
@@ -94,7 +90,6 @@ model = IVCHI(feature_size=7, additivity_order=2, op='Algebraic_interval')
 - 子模型多样性配置
 - 统一的训练接口
 
-**适用场景**: 需要提升预测性能的复杂任务
 
 **快速开始**:
 ```python
@@ -185,15 +180,6 @@ X = torch.cat([
     torch.tensor(data_up.values, dtype=torch.float32)
 ], dim=1)
 ```
-
-## 模型选择指南
-
-| 场景 | 推荐模型 | 说明 |
-|------|---------|------|
-| 一般区间值预测 | IVIE_FM | 参数效率高，训练快 |
-| 需要严格排序 | IVIE_Moebius | Admissible排序机制 |
-| 累积效应任务 | IVCHI | 使用区间加法 |
-| 复杂/高精度任务 | CHI_IE | 集成多个子模型 |
 
 ## 参数推荐配置
 

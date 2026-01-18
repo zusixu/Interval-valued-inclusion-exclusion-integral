@@ -33,9 +33,9 @@ def check_conda_environment(expected_env='ieiv'):
     return True
 
 
-from IVIE.ivie import IE
-from IVIE.iv_loss import interval_loss as IntervalLoss
-from IVIE.iv_loss import ImprovedIntervalLoss, HausdorffIntervalLoss
+from IVIE_FM.ivie import IE
+from IVIE_FM.iv_loss import interval_loss as IntervalLoss
+from IVIE_FM.iv_loss import ImprovedIntervalLoss, HausdorffIntervalLoss
 
 
 

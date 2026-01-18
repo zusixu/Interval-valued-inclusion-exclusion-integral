@@ -9,13 +9,8 @@ def generate_data():
     从UCI获取数据集并通过加减标准差的方式获得区间值数据集
     :return: 训练集和测试集
     """
-    # california房价预测数据集
-
-
-
-
     # fetch dataset
-    auto_mpg = fetch_ucirepo(id=9)
+    auto_mpg = fetch_ucirepo(id=477)
 
     # data (as pandas dataframes)
     X = auto_mpg.data.features
@@ -35,8 +30,14 @@ def generate_data():
         std_deviation = df[feature].std()
         data_low[feature] = df[feature] - 2 * std_deviation
         data_up[feature] = df[feature] + 2 * std_deviation
-    data_low = pd.concat((data_low, y), axis=1)
-    data_up = pd.concat((data_up, y), axis=1)
+    
+    # 为标签y也创建上下界
+    y_std = y.std()
+    y_low = y - 2 * y_std
+    y_up = y + 2 * y_std
+    
+    data_low = pd.concat((data_low, y_low), axis=1)
+    data_up = pd.concat((data_up, y_up), axis=1)
     Df = pd.concat((data_low, data_up), axis=1)
     lenth = len(data_up.columns)  # 给出特征＋标签的数量
 

@@ -11,8 +11,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from IVCHI.ivchi import IVCHI
-from IVIE.ivie import IE
-from IVIE.iv_loss import interval_loss as IntervalLoss
+from IVIE_FM.ivie import IE
+from IVIE_FM.iv_loss import interval_loss as IntervalLoss
 
 
 def generate_interval_data(n_samples=100, n_features=3, seed=42):

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import sys
 sys.path.append('..')
-from IVIE.ivie import IE
+from IVIE_FM.ivie import IE
 
 
 class IVCHI(IE):
@@ -12,14 +12,14 @@ class IVCHI(IE):
     区间加法规则：[a,b]+[c,d]=[a+c,b+d]
     """
     
-    def __init__(self, feature_size, additivity_order=None, op='Algebraic_interval', alpha=1, beta=0, device='cuda'):
+    def __init__(self, feature_size, additivity_order=None, op='Min_interval', alpha=1, beta=0, device='cuda'):
         """
         初始化IVCHI模型
         
         参数:
             feature_size: 特征维度
             additivity_order: 加性阶数，默认为None（等于feature_size）
-            op: 操作类型，'Algebraic_interval' 或 'Min_interval'
+            op: 操作类型'Min_interval'
             alpha: Min_interval操作的alpha参数
             beta: Min_interval操作的beta参数
             device: 设备类型，'cuda' 或 'cpu'
@@ -43,50 +43,41 @@ class IVCHI(IE):
         
         featuers_datal, featuers_datau = self.op(datal, datau)
         
-        # 当 additivity_order < columns_num 时，op 返回的特征数量会减少
-        # 需要构建对应的 feature_matrix 子集
+        # 当 additivity_order < columns_num 时，需要调整 feature_matrix
+        # op 生成的特征按位掩码顺序排列，数量由 additivity_order 决定
         actual_num_features = featuers_datal.size(1)
         expected_num_features = 2**self.columns_num - 1
         
+        feature_matrix_dense = self.feature_matrix.to_dense()
+        
         if actual_num_features < expected_num_features:
-            # 计算哪些位掩码被保留（阶数 <= additivity_order）
-            valid_masks = []
-            for mask in range(1, 2**self.columns_num):
-                order = bin(mask).count('1')
-                if order <= self.add:
-                    valid_masks.append(mask)
-            
-            # 构建子feature_matrix：只保留valid_masks对应的行和列
+            # feature_matrix 的前 actual_num_features 行对应 op 生成的特征
+            # 提取对应的列：每个特征对应完整的列空间的子集
+            # 具体来说，需要提取前 actual_num_features 对应的列（每个特征2列）
             # feature_matrix 形状: (2^n-1, 2*(2^n-1))
-            # 我们需要: (num_valid, 2*num_valid)
-            feature_matrix_dense = self.feature_matrix.to_dense()
+            # 我们需要: (actual_num_features, 2*actual_num_features)
             
-            # 行索引：valid_masks - 1 (因为mask从1开始，索引从0开始)
-            row_indices = [m - 1 for m in valid_masks]
+            # 提取前 actual_num_features 行和对应的列
+            feature_matrix_to_use = feature_matrix_dense[:actual_num_features, :2*actual_num_features]
             
-            # 列索引：每个valid_mask对应两列 (2*idx, 2*idx+1)
-            col_indices = []
-            for idx in row_indices:
-                col_indices.extend([2*idx, 2*idx+1])
-            
-            # 提取子矩阵
-            sub_matrix = feature_matrix_dense[row_indices, :][:, col_indices]
-            feature_matrix_to_use = sub_matrix
-            
-            # FM已经在ivie_nn_vars中被正确缩小，直接使用
-            FM_to_use = self.FM
+            # FM 也需要只保留前 actual_num_features 个（对应相同的特征组合）
+            FM_to_use = self.FM[:actual_num_features, :]
         else:
-            feature_matrix_to_use = self.feature_matrix.to_dense()
-            FM_to_use = self.FM
+            # 使用完整的 feature_matrix 和 FM（不包括全集，因为FM包含全集）
+            # FM形状: (2^n, 1) 包含全集
+            # feature_matrix形状: (2^n-1, 2*(2^n-1))
+            # 去掉FM的最后一个元素（全集）以匹配feature_matrix的行数
+            feature_matrix_to_use = feature_matrix_dense
+            FM_to_use = self.FM[:expected_num_features, :]
         
         featuers_datal_mt = torch.matmul(featuers_datal, feature_matrix_to_use)
         featuers_datau_mt = torch.matmul(featuers_datau, feature_matrix_to_use)
         
         # 拆分左右端点
-        a = torch.matmul(FM_to_use.T, featuers_datal_mt[:, ::2].T)  # 奇数列（左端点）
-        b = torch.matmul(FM_to_use.T, featuers_datau_mt[:, ::2].T)  # 奇数列（左端点）
-        c = torch.matmul(FM_to_use.T, featuers_datal_mt[:, 1::2].T) # 偶数列（右端点）
-        d = torch.matmul(FM_to_use.T, featuers_datau_mt[:, 1::2].T) # 偶数列（右端点）
+        a = torch.matmul(FM_to_use.T, featuers_datal_mt[:, ::2].T)  # 偶数列（左端点）
+        b = torch.matmul(FM_to_use.T, featuers_datau_mt[:, ::2].T)  # 偶数列（左端点）
+        c = torch.matmul(FM_to_use.T, featuers_datal_mt[:, 1::2].T) # 奇数列（右端点）
+        d = torch.matmul(FM_to_use.T, featuers_datau_mt[:, 1::2].T) # 奇数列（右端点）
         
         # ==================== 修改点 ====================
         # 原始IE: 区间减法 [a,b]-[c,d]=[min(a-c,b-d), b-d]

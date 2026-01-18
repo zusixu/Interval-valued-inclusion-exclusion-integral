@@ -1,0 +1,19 @@
+# Python 3.9+
+# Core dependencies
+torch==2.2.2
+torchvision==0.17.2
+numpy
+pandas
+
+# Scientific computing
+scipy
+scikit-learn
+
+# Progress bars
+tqdm
+
+# Data fetching
+ucimlrepo
+
+# Visualization
+matplotlib

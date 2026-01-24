@@ -6,20 +6,24 @@ IVCHI vs IVIE_FM vs IVIE_Moebius 性能对比程序
 """
 import sys
 from pathlib import Path
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-import time
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+DATA_INDEX_PATH = _PROJECT_ROOT / "data_test" / "data_index.xlsx"
+MSE_RESULT_PATH = _PROJECT_ROOT / "data_test" / "mse_results.xlsx"
+FIG_DIR = _PROJECT_ROOT / "figs"
 
 from data_build import generate_data
 from IVIE_FM.ivie import IE as IE_FM
@@ -62,7 +66,7 @@ def plot_rec_curve(errors_dict, save_path='comparison_rec_curve.png'):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"\nREC曲线已保存到: {save_path}")
-    plt.show()
+    # plt.show()
 
 
 def plot_training_curves(history_dict, save_path='comparison_training_curves.png'):
@@ -303,6 +307,23 @@ def print_comparison_table(errors_dict, history_dict):
     print("="*80)
 
 
+def save_mse_records(records):
+    """将新增的 MSE 记录合并写入统一表格"""
+    if not records:
+        return
+
+    new_df = pd.DataFrame(records)
+    if MSE_RESULT_PATH.exists():
+        existing = pd.read_excel(MSE_RESULT_PATH)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined.drop_duplicates(subset=["dataset", "experiment", "model"], keep="last", inplace=True)
+    else:
+        combined = new_df
+
+    combined.to_excel(MSE_RESULT_PATH, index=False)
+    print(f"MSE 结果已更新: {MSE_RESULT_PATH}")
+
+
 def train_single_model(config, train_data, test_data, n_features, epochs=30, progress_line=None):
     """
     训练单个模型的函数（用于并行执行）
@@ -328,8 +349,10 @@ def train_single_model(config, train_data, test_data, n_features, epochs=30, pro
     # 在子进程中创建DataLoader（DataLoader无法pickle序列化传递）
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
-    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
+    # batch_size = max(1, len(train_dataset)//5)
+    batch_size = 512
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     model_name = config['name']
     start_time = time.time()
@@ -395,7 +418,10 @@ def train_single_model(config, train_data, test_data, n_features, epochs=30, pro
         # 使用损失函数返回的hausdorff距离，而不是total_loss
         _, hausdorff_distance = criterion(pred_l, pred_u, y_test_device)
         errors = hausdorff_distance
-    
+        mse_value = torch.mean(
+            ((pred_l - y_test_device[:, 0]) ** 2 + (pred_u - y_test_device[:, 1]) ** 2) / 2
+        ).item()
+
     errors_np = errors.cpu().numpy().flatten()
     
     elapsed_time = time.time() - start_time
@@ -410,46 +436,37 @@ def train_single_model(config, train_data, test_data, n_features, epochs=30, pro
             'val_loss': model.val_loss_list,
             'final_val_loss': val_loss
         },
-        'errors': errors_np
+        'errors': errors_np,
+        'mse': mse_value
     }
 
 
-def main():
-    """主函数"""
+def run_dataset_experiment(data_name: str, data_id: int, epochs: int = 3000):
     print("\n" + "="*80)
-    print("IVIE_FM vs IVIE_Moebius 框架性能对比")
+    print(f"IVIE_FM vs IVIE_Moebius 框架性能对比 - 数据集: {data_name} (id={data_id})")
     print("="*80)
-    
-    # 设置设备
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"使用设备: {device}")
-    
-    # 准备数据 - 直接使用DataLoader
+
     print("加载数据集...")
-    X_train, X_test, y_train, y_test = generate_data()
-    
-    # 转换为PyTorch张量
+    X_train, X_test, y_train, y_test = generate_data(data_id)
+
     X_train_tensor = torch.FloatTensor(X_train.values)
     y_train_tensor = torch.FloatTensor(y_train.values)
     X_test_tensor = torch.FloatTensor(X_test.values)
     y_test_tensor = torch.FloatTensor(y_test.values)
-    
-    # 创建数据集和DataLoader
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-    
+
     n_features = X_train_tensor.shape[1] // 2
-    
-    print(f"训练集大小: {len(train_dataset)}")
-    print(f"测试集大小: {len(test_dataset)}")
-    print(f"特征数量: {n_features}")
-    
-    # 配置要测试的模型
+    add_order = 3
+
+    print(f"训练集大小: {len(X_train_tensor)} | 测试集大小: {len(X_test_tensor)} | 特征数量: {n_features}")
+
     configs = [
         {
             'name': 'IVCHI_FM',
             'type': 'IVCHI',
-            'additivity_order': 3,
+            'additivity_order': add_order,
             'op': 'Min_interval',
             'alpha': 0.5,
             'beta': 0.0
@@ -457,7 +474,7 @@ def main():
         {
             'name': 'IVIE_FM (Algebraic)',
             'type': 'FM',
-            'additivity_order': 3,
+            'additivity_order': add_order,
             'op': 'Algebraic_interval',
             'alpha': 0.5,
             'beta': 0.0
@@ -465,7 +482,7 @@ def main():
         {
             'name': 'IVCHI_Moebius',
             'type': 'Moebius',
-            'additivity_order': 3,
+            'additivity_order': add_order,
             'op': 'Min_interval',
             'alpha': 0.5,
             'beta': 0.0,
@@ -474,44 +491,39 @@ def main():
         {
             'name': 'IVIE_Moebius (Algebraic)',
             'type': 'Moebius',
-            'additivity_order': 3,
+            'additivity_order': add_order,
             'op': 'Algebraic_interval',
             'alpha': 0.5,
             'beta': 0.0,
             'fuzzy_measure': 'OutputLayer_single'
         }
     ]
-    
+
     history_dict = {}
     errors_dict = {}
-    models_dict = {}  # 存储模型实例
-    
-    # 并行训练模型
-    epochs = 3000
-    # 传递张量数据（DataLoader无法在进程间传递）
+    models_dict = {}
+    mse_records = []
+
     train_data = (X_train_tensor, y_train_tensor)
     test_data = (X_test_tensor, y_test_tensor)
-    
+
     print(f"\n{'='*80}")
     print(f"使用并行训练 - 同时训练 {len(configs)} 个模型")
     print(f"CPU核心数: {mp.cpu_count()}")
     print(f"{'='*80}\n")
-    
-    # 预留多行空间用于显示进度
-    for i in range(len(configs)):
-        print()  # 打印空行
-    
+
+    # 为进度预留行
+    for _ in range(len(configs)):
+        print()
+
     total_start_time = time.time()
-    
-    # 使用进程池并行训练，为每个模型分配行号
+
     with ProcessPoolExecutor(max_workers=min(len(configs), mp.cpu_count())) as executor:
-        # 提交所有训练任务，为每个任务分配一个行号
         futures = {}
-        for idx, config in enumerate(configs):
-            future = executor.submit(train_single_model, config, train_data, test_data, n_features, epochs, idx)
-            futures[future] = config['name']
-        
-        # 收集结果
+        for idx, cfg in enumerate(configs):
+            future = executor.submit(train_single_model, cfg, train_data, test_data, n_features, epochs, idx)
+            futures[future] = cfg['name']
+
         for future in as_completed(futures):
             result = future.result()
             model_name = result['name']
@@ -521,36 +533,49 @@ def main():
                 'model': result['model'],
                 'type': result['model_type']
             }
-    
-    # 移动光标到进度条下方
-    print(f'\n\n{"="*80}')
+            mse_records.append({
+                'dataset': data_name,
+                'experiment': '不同结构对比',
+                'model': result['name'],
+                'mse': result['mse']
+            })
+
     total_elapsed = time.time() - total_start_time
-    print(f"并行训练总耗时: {total_elapsed:.2f}秒")
-    print(f"{'='*80}")
-    
-    # 可视化对比
+    print(f"\n并行训练总耗时: {total_elapsed:.2f}秒")
+
+    rec_path = FIG_DIR / f"{data_name}_不同结构对比.png"
+    training_path = FIG_DIR / f"{data_name}_不同结构对比_training.png"
+
     print("\n生成可视化图表...")
-    plot_training_curves(history_dict, 'comparison_training_curves.png')
-    plot_rec_curve(errors_dict, 'comparison_rec_curve.png')
-    
-    # 打印对比表格
-    print_comparison_table(errors_dict, history_dict)
-    
-    # 打印测试集前5个样本的预测结果对比
-    print_sample_predictions(models_dict, X_test_tensor, y_test_tensor, n_samples=5)
-    
-    # # 打印IVIE_FM模型的模糊测度值
-    # print("\n" + "="*80)
-    # print("IVIE_FM 模型的模糊测度值")
-    # print("="*80)
-    # for model_name, model_info in models_dict.items():
-    #     if model_info['type'] == 'FM':
-    #         print(f"\n模型: {model_name}")
-    #         print_fuzzy_measures(model_info['model'], n_features)
-    
+    # plot_training_curves(history_dict, str(training_path))
+    plot_rec_curve(errors_dict, str(rec_path))
+
+    # print_comparison_table(errors_dict, history_dict)
+    # print_sample_predictions(models_dict, X_test_tensor, y_test_tensor, n_samples=5)
+
     print("\n" + "="*80)
     print("对比完成！")
     print("="*80)
+
+    return mse_records
+
+
+def main():
+    parser = argparse.ArgumentParser(description="IVIE_FM vs IVIE_Moebius 多数据集对比")
+    parser.add_argument('--epochs', type=int, default=1500, help='训练轮数 (默认 1500)')
+    args = parser.parse_args()
+
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    data_index = pd.read_excel(DATA_INDEX_PATH)
+    all_records = []
+
+    for _, row in data_index.iterrows():
+        data_name = str(row['data_name'])
+        data_id = int(row['data_id'])
+        all_records.extend(run_dataset_experiment(data_name, data_id, epochs=args.epochs))
+
+    save_mse_records(all_records)
 
 
 if __name__ == "__main__":

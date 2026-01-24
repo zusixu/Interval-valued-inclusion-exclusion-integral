@@ -2,15 +2,20 @@
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from ucimlrepo import fetch_ucirepo
+import argparse
 
 
-def generate_data():
+def generate_data(data_id: int = 9):
     """
     从UCI获取数据集并通过加减标准差的方式获得区间值数据集
-    :return: 训练集和测试集
+
+    Args:
+        data_id: UCI 数据集的编号，默认 9 (Auto MPG)
+
+    Returns:
+        归一化并拆分好的 X_train, X_test, y_train, y_test
     """
-    # fetch dataset
-    auto_mpg = fetch_ucirepo(id=477)
+    auto_mpg = fetch_ucirepo(id=data_id)
 
     # data (as pandas dataframes)
     X = auto_mpg.data.features
@@ -48,3 +53,13 @@ def generate_data():
     X_test = pd.concat((data_test.iloc[:, :lenth - 1], data_test.iloc[:, lenth:2 * lenth - 1]), axis=1)
     y_test = pd.concat((data_test.iloc[:, lenth - 1:lenth], data_test.iloc[:, 2 * lenth - 1:2 * lenth]), axis=1)
     return X_train, X_test, y_train, y_test
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Build interval data from UCI repository")
+    parser.add_argument("--id", type=int, default=9, help="UCI 数据集编号 (默认 9: Auto MPG)")
+    args = parser.parse_args()
+
+    X_train, X_test, y_train, y_test = generate_data(args.id)
+    print(f"数据集 {args.id} 已准备完毕：")
+    print(f"X_train: {X_train.shape}, X_test: {X_test.shape}, y_train: {y_train.shape}, y_test: {y_test.shape}")

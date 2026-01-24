@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 
 # 添加项目根目录到path
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +156,8 @@ class EnsembleIE(nn.Module):
         # 用于记录训练历史
         self.train_loss_list = []
         self.val_loss_list = []
+        self.lrs_list = []
+        self.gradient_info = []
     
     def forward(self, x):
         """
@@ -196,7 +199,7 @@ class EnsembleIE(nn.Module):
     def fit_and_valid(self, train_Loader, test_Loader, criterion, optimizer, 
                      device='cuda', epochs=100, check_gradient=True, 
                      gradient_clip=1.0, model_name=None, progress_line=None,
-                     early_stopping=True, patience=30):
+                     early_stopping=True, patience=100):
         """
         训练和验证模型
         
@@ -209,10 +212,10 @@ class EnsembleIE(nn.Module):
             epochs: 训练轮数
             check_gradient: 是否检查梯度
             gradient_clip: 梯度裁剪阈值
-            model_name: 模型名称
-            progress_line: 进度条所在行号
+            model_name: 模型名称（用于多行进度显示）
+            progress_line: 进度条所在行号（0-based，用于多行并行训练）
             early_stopping: 是否启用早停
-            patience: 早停的耐心值
+            patience: 早停的耐心值（验证损失不改善的最大epoch数）
         
         Returns:
             final_val_loss: 最终验证损失
@@ -220,6 +223,8 @@ class EnsembleIE(nn.Module):
         start = time.time()
         self.train_loss_list = []
         self.val_loss_list = []
+        self.lrs_list = []
+        self.gradient_info = []  # 记录梯度信息
         
         # 早停相关变量
         best_val_loss = float('inf')
@@ -229,6 +234,11 @@ class EnsembleIE(nn.Module):
         for epoch in range(epochs):
             train_loss = 0
             val_loss = 0
+            epoch_grad_norm = 0
+            epoch_grad_max = 0
+            epoch_grad_min = float('inf')
+            batch_count = 0
+            has_nan_grad = False
             
             # 训练阶段
             self.train()
@@ -240,20 +250,71 @@ class EnsembleIE(nn.Module):
                 loss, error = criterion(outputsl, outputsu, labels)
                 train_loss += loss.item() * len(labels)
                 
+                # 检查loss是否为NaN
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"警告: Epoch {epoch+1}, Batch {i+1} - Loss为NaN或Inf!")
                     continue
                 
                 loss.backward()
                 
+                # 梯度检查
+                if check_gradient:
+                    total_grad_norm = 0
+                    total_grad_max = 0
+                    total_grad_min = float('inf')
+                    has_grad = False
+                    
+                    for param in self.parameters():
+                        if param.grad is not None:
+                            has_grad = True
+                            grad = param.grad
+                            grad_norm = grad.norm().item()
+                            grad_max = grad.abs().max().item()
+                            grad_min = grad.abs().min().item()
+                            
+                            total_grad_norm += grad_norm
+                            total_grad_max = max(total_grad_max, grad_max)
+                            total_grad_min = min(total_grad_min, grad_min)
+                            
+                            # 检查NaN梯度
+                            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                                has_nan_grad = True
+                                print(f"警告: Epoch {epoch+1}, Batch {i+1} - 梯度包含NaN或Inf!")
+                                # 将NaN梯度置零
+                                param.grad = torch.where(
+                                    torch.isnan(grad) | torch.isinf(grad),
+                                    torch.zeros_like(grad),
+                                    grad
+                                )
+                    
+                    if has_grad:
+                        epoch_grad_norm += total_grad_norm
+                        epoch_grad_max = max(epoch_grad_max, total_grad_max)
+                        epoch_grad_min = min(epoch_grad_min, total_grad_min)
+                        batch_count += 1
+                
                 # 梯度裁剪
                 if gradient_clip is not None:
                     torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip)
                 
                 optimizer.step()
+                
+                # 记录学习率
+                current_lr = optimizer.param_groups[0]["lr"]
+                self.lrs_list.append(current_lr)
             
-            train_loss = train_loss / len(train_Loader.dataset)
-            self.train_loss_list.append(train_loss)
+            avg_train_loss = train_loss / len(train_Loader.dataset)
+            
+            # 记录梯度统计信息
+            if batch_count > 0:
+                avg_grad_norm = epoch_grad_norm / batch_count
+                self.gradient_info.append({
+                    'epoch': epoch + 1,
+                    'avg_grad_norm': avg_grad_norm,
+                    'max_grad': epoch_grad_max,
+                    'min_grad': epoch_grad_min,
+                    'has_nan': has_nan_grad
+                })
             
             # 验证阶段
             self.eval()
@@ -264,39 +325,191 @@ class EnsembleIE(nn.Module):
                     loss, error = criterion(outputsl, outputsu, labels)
                     val_loss += loss.item() * len(labels)
             
-            val_loss = val_loss / len(test_Loader.dataset)
-            self.val_loss_list.append(val_loss)
+            avg_val_loss = val_loss / len(test_Loader.dataset)
+            
+            # 打印训练信息（支持多行并行显示）
+            progress = (epoch + 1) / epochs
+            bar_length = 30
+            filled_length = int(bar_length * progress)
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+            
+            # 计算时间
+            elapsed_time = time.time() - start
+            if epoch > 0:
+                avg_time_per_epoch = elapsed_time / (epoch + 1)
+                eta = avg_time_per_epoch * (epochs - epoch - 1)
+                time_str = f"{elapsed_time:.0f}s < {eta:.0f}s"
+            else:
+                time_str = f"{elapsed_time:.0f}s"
+            
+            # 构建输出信息
+            if model_name:
+                model_prefix = f"{model_name:<35}"
+            else:
+                model_prefix = ""
+            
+            if check_gradient and batch_count > 0:
+                output = f'{model_prefix}[{bar}] {epoch+1}/{epochs} | loss:{avg_train_loss:.4f}/{avg_val_loss:.4f} | grad:{avg_grad_norm:.3f} | {time_str}'
+            else:
+                output = f'{model_prefix}[{bar}] {epoch+1}/{epochs} | loss:{avg_train_loss:.4f}/{avg_val_loss:.4f} | {time_str}'
+            
+            # 如果指定了行号，使用ANSI转义码定位到特定行
+            if progress_line is not None:
+                # 保存当前光标位置，移动到指定行，打印，恢复光标位置
+                print(f'\033[s\033[{progress_line+1};0H{output}\033[K\033[u', end='', flush=True)
+            else:
+                # 单行刷新
+                print(f'\r{output}', end='', flush=True)
+            
+            self.train_loss_list.append(avg_train_loss)
+            self.val_loss_list.append(avg_val_loss)
             
             # 早停检查
             if early_stopping:
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
                     patience_counter = 0
                     best_model_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
                 else:
                     patience_counter += 1
                 
                 if patience_counter >= patience:
-                    print(f"\n[{model_name}] 早停触发！在epoch {epoch+1}停止训练。")
+                    if progress_line is not None:
+                        early_stop_msg = f"{model_name:<35}⚠ Early stopping at epoch {epoch+1}/{epochs}"
+                        print(f'\033[s\033[{progress_line+1};0H{early_stop_msg}\033[K\033[u', flush=True)
+                    else:
+                        print(f"\n早停触发于 epoch {epoch + 1}")
+                    
                     # 恢复最佳模型
                     self.load_state_dict(best_model_state)
                     break
-            
-            # 打印进度（每10个epoch）
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                elapsed = time.time() - start
-                if model_name:
-                    print(f"[{model_name}] Epoch {epoch+1}/{epochs} - "
-                          f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, "
-                          f"Time: {elapsed:.2f}s")
-                else:
-                    print(f"Epoch {epoch+1}/{epochs} - "
-                          f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
-        elapsed = time.time() - start
-        print(f"\n训练完成！总耗时: {elapsed:.2f}秒")
+        # 训练结束，如果是多行模式，移动到指定行打印完成信息
+        if progress_line is not None:
+            final_msg = f"{model_name:<35}✓ Completed! Time: {time.time() - start:.1f}s"
+            print(f'\033[s\033[{progress_line+1};0H{final_msg}\033[K\033[u', flush=True)
+        else:
+            print(f"\n\nTraining completed! Total time: {time.time() - start:.2f}s")
         
-        return val_loss if not early_stopping else best_val_loss
+        return best_val_loss if early_stopping else avg_val_loss
+    
+    def _print_gradient_report(self):
+        """打印梯度诊断报告"""
+        if len(self.gradient_info) == 0:
+            print("无梯度信息可供分析")
+            return
+        
+        print("\n" + "="*60)
+        print("梯度诊断报告")
+        print("="*60)
+        
+        avg_norms = [info['avg_grad_norm'] for info in self.gradient_info]
+        max_grads = [info['max_grad'] for info in self.gradient_info]
+        min_grads = [info['min_grad'] for info in self.gradient_info]
+        nan_count = sum(1 for info in self.gradient_info if info['has_nan'])
+        
+        print(f"总Epochs: {len(self.gradient_info)}")
+        print(f"平均梯度范数: {np.mean(avg_norms):.6f}")
+        print(f"梯度范数范围: [{np.min(avg_norms):.6f}, {np.max(avg_norms):.6f}]")
+        print(f"最大梯度值: {np.max(max_grads):.6f}")
+        print(f"最小梯度值: {np.min(min_grads):.10f}")
+        print(f"包含NaN的Epoch数: {nan_count}")
+        
+        # 诊断问题
+        if nan_count > 0:
+            print("\n⚠️ 警告: 存在NaN梯度，可能原因:")
+            print("  - 学习率过大")
+            print("  - 数值溢出")
+            print("  - 除零操作")
+        
+        if np.mean(avg_norms) < 1e-6:
+            print("\n⚠️ 警告: 梯度过小（梯度消失），可能原因:")
+            print("  - torch.abs()在0附近梯度不稳定")
+            print("  - torch.min()可能阻断梯度")
+            print("  - 网络层数过深")
+        
+        if np.max(max_grads) > 100:
+            print("\n⚠️ 警告: 梯度过大（梯度爆炸），建议:")
+            print("  - 减小学习率")
+            print("  - 增加梯度裁剪")
+        
+        print("="*60)
+    
+    def plot_training_history(self, save_path=None, show=True):
+        """
+        可视化训练历史
+        
+        Args:
+            save_path: 保存图片的路径，如果为None则不保存
+            show: 是否显示图片
+        """
+        import matplotlib.pyplot as plt
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # 1. 训练和验证损失
+        ax1 = axes[0, 0]
+        epochs = range(1, len(self.train_loss_list) + 1)
+        ax1.plot(epochs, self.train_loss_list, 'b-', label='Train Loss', linewidth=2)
+        ax1.plot(epochs, self.val_loss_list, 'r-', label='Val Loss', linewidth=2)
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+        ax1.legend(fontsize=11)
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 学习率变化
+        ax2 = axes[0, 1]
+        if hasattr(self, 'lrs_list') and len(self.lrs_list) > 0:
+            ax2.plot(self.lrs_list, 'g-', linewidth=2)
+            ax2.set_xlabel('Iteration', fontsize=12)
+            ax2.set_ylabel('Learning Rate', fontsize=12)
+            ax2.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+            ax2.grid(True, alpha=0.3)
+            ax2.set_yscale('log')
+        else:
+            ax2.text(0.5, 0.5, 'No LR data available', 
+                    ha='center', va='center', fontsize=12)
+            ax2.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        
+        # 3. 梯度范数变化
+        ax3 = axes[1, 0]
+        if hasattr(self, 'gradient_info') and len(self.gradient_info) > 0:
+            grad_epochs = [info['epoch'] for info in self.gradient_info]
+            avg_grad_norms = [info['avg_grad_norm'] for info in self.gradient_info]
+            ax3.plot(grad_epochs, avg_grad_norms, 'purple', linewidth=2)
+            ax3.set_xlabel('Epoch', fontsize=12)
+            ax3.set_ylabel('Average Gradient Norm', fontsize=12)
+            ax3.set_title('Gradient Norm Over Time', fontsize=14, fontweight='bold')
+            ax3.grid(True, alpha=0.3)
+            ax3.set_yscale('log')
+        else:
+            ax3.text(0.5, 0.5, 'No gradient data available', 
+                    ha='center', va='center', fontsize=12)
+            ax3.set_title('Gradient Norm Over Time', fontsize=14, fontweight='bold')
+        
+        # 4. 损失对比（对数坐标）
+        ax4 = axes[1, 1]
+        ax4.semilogy(epochs, self.train_loss_list, 'b-', label='Train Loss', linewidth=2)
+        ax4.semilogy(epochs, self.val_loss_list, 'r-', label='Val Loss', linewidth=2)
+        ax4.set_xlabel('Epoch', fontsize=12)
+        ax4.set_ylabel('Loss (log scale)', fontsize=12)
+        ax4.set_title('Loss (Logarithmic Scale)', fontsize=14, fontweight='bold')
+        ax4.legend(fontsize=11)
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"训练历史图已保存至: {save_path}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig
     
     def get_base_model_outputs(self, x):
         """
@@ -315,3 +528,32 @@ class EnsembleIE(nn.Module):
                 out_l, out_u = model(x)
                 outputs.append((out_l, out_u))
         return outputs
+
+    # ====== 训练/微调辅助 ======
+    def freeze_base_models(self):
+        """冻结子模型参数，用于仅训练集成层。"""
+        for param in self.base_models.parameters():
+            param.requires_grad = False
+
+    def unfreeze_base_models(self):
+        """解冻子模型参数。"""
+        for param in self.base_models.parameters():
+            param.requires_grad = True
+
+    def freeze_ensemble(self):
+        """冻结集成层参数，用于先行预训练子模型。"""
+        for param in self.ensemble_model.parameters():
+            param.requires_grad = False
+
+    def unfreeze_ensemble(self):
+        """解冻集成层参数。"""
+        for param in self.ensemble_model.parameters():
+            param.requires_grad = True
+
+    def base_parameters(self):
+        """便于单独给子模型创建优化器。"""
+        return self.base_models.parameters()
+
+    def ensemble_parameters(self):
+        """便于单独给集成层创建优化器。"""
+        return self.ensemble_model.parameters()
